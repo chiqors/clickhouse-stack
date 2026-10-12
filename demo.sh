@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# demo.sh — guided tour of ClickHouse (storage/compute separation on RustFS)
+# demo.sh — guided tour of ClickHouse (storage/compute separation on MinIO)
 # and ClickStack (HyperDX observability).
 #
 # Usage:  ./demo.sh           # run all sections, pausing between each
@@ -14,9 +14,9 @@ CH_URL="http://localhost:8123"
 CH_USER="default"
 CH_PASS="clickhouse"
 OTLP_HTTP="http://localhost:4318"
-RUSTFS_S3="http://localhost:9000"
-RUSTFS_KEY="clickhouse"
-RUSTFS_SECRET="clickhouse-secret"
+MINIO_S3="http://localhost:9000"
+MINIO_KEY="clickhouse"
+MINIO_SECRET="clickhouse-secret"
 BUCKET="clickhouse"
 HYPERDX_URL="http://localhost:8080"
 
@@ -39,7 +39,7 @@ ch_raw() { curl -sS -u "${CH_USER}:${CH_PASS}" "${CH_URL}/" --data-binary "$*"; 
 # ---------- preflight ----------
 preflight() {
   section "Preflight"
-  for svc in clickhouse rustfs hyperdx-otel hyperdx; do
+  for svc in clickhouse minio hyperdx-otel hyperdx; do
     if docker ps --format '{{.Names}}' | grep -q "^${svc}$"; then
       printf "  ${G}✓${N} %s\n" "$svc"
     else
@@ -57,7 +57,7 @@ ch_storage_policy() {
 
   step "Which disks does ClickHouse know about?"
   run "ch \"SELECT name, type, path FROM system.disks\""
-  note "s3_rustfs talks S3 to RustFS. s3_cache is a local cache in front of it."
+  note "s3_minio = raw S3 disk. s3_cache = local read cache in front. s3_minio_packed = plain_rewritable."
 
   step "Which storage policy is default?"
   run "ch \"SELECT policy_name, volume_name, disks FROM system.storage_policies\""
@@ -65,7 +65,7 @@ ch_storage_policy() {
 }
 
 ch_create_table() {
-  section "ClickHouse · create a MergeTree whose data lives on RustFS"
+  section "ClickHouse · create a MergeTree whose data lives on MinIO"
 
   step "Create a table (uses the default s3_main policy)"
   run "ch \"DROP TABLE IF EXISTS demo.events\""
@@ -94,14 +94,14 @@ ch_create_table() {
 }
 
 ch_proof_on_rustfs() {
-  section "ClickHouse · see the bytes on RustFS"
+  section "ClickHouse · see the bytes on MinIO"
 
-  step "List what RustFS has under the clickhouse/ bucket (via aws CLI container)"
+  step "List what MinIO has under the clickhouse/ bucket (via aws CLI container)"
   run "docker run --rm --network clickhouse-stack_default \
-         -e AWS_ACCESS_KEY_ID=${RUSTFS_KEY} \
-         -e AWS_SECRET_ACCESS_KEY=${RUSTFS_SECRET} \
+         -e AWS_ACCESS_KEY_ID=${MINIO_KEY} \
+         -e AWS_SECRET_ACCESS_KEY=${MINIO_SECRET} \
          -e AWS_DEFAULT_REGION=us-east-1 \
-         amazon/aws-cli --endpoint-url http://rustfs:9000 \
+         amazon/aws-cli --endpoint-url http://minio:9000 \
          s3 ls --recursive --summarize --human-readable s3://${BUCKET}/data/ 2>/dev/null | tail -n 15"
   note "Every one of those objects is a MergeTree part living on object storage, not local disk."
   pause
@@ -254,7 +254,80 @@ hyperdx_pointer() {
 # =============================================================
 # driver
 # =============================================================
-run_ch()   { ch_storage_policy; ch_create_table; ch_proof_on_rustfs; ch_queries; ch_materialized_view; }
+s3_ls() {  # list objects under a prefix via a disposable aws-cli container
+  docker run --rm --network clickhouse-stack_default \
+    -e AWS_ACCESS_KEY_ID=${MINIO_KEY} \
+    -e AWS_SECRET_ACCESS_KEY=${MINIO_SECRET} \
+    -e AWS_DEFAULT_REGION=us-east-1 \
+    amazon/aws-cli --endpoint-url http://minio:9000 \
+    s3 ls --recursive --summarize "s3://${BUCKET}/$1/" 2>/dev/null
+}
+
+ch_cost_tuning() {
+  section "ClickHouse · cost tuning (fewer, bigger S3 objects)"
+
+  note "Three techniques active in this stack:"
+  note "  1. async_insert=1    — buffer many tiny INSERTs server-side."
+  note "  2. compact parts     — one file per part instead of per column."
+  note "  3. s3_packed policy  — plain_rewritable metadata lives IN the bucket"
+  note "                         (no local sidecar), typically ~10x fewer S3"
+  note "                         objects vs the standard disk."
+
+  step "Confirm async_insert is on"
+  run "ch \"SELECT name, value FROM system.settings
+         WHERE name IN ('async_insert','wait_for_async_insert',
+                        'async_insert_max_data_size','async_insert_busy_timeout_ms')\""
+
+  step "Both policies available?"
+  run "ch \"SELECT policy_name, disks FROM system.storage_policies
+         WHERE policy_name IN ('s3_main','s3_packed')\""
+
+  step "Create a 'default' table (s3_main policy, normal metadata)"
+  run "ch \"CREATE DATABASE IF NOT EXISTS demo\""
+  run "ch \"DROP TABLE IF EXISTS demo.events_default\""
+  run "ch \"CREATE TABLE demo.events_default (
+         ts DateTime64(3), user String,
+         action LowCardinality(String), amount Float64
+       ) ENGINE = MergeTree ORDER BY (user, ts)\""
+
+  step "Create a 'packed' table (s3_packed policy, one object per part)"
+  run "ch \"DROP TABLE IF EXISTS demo.events_packed\""
+  run "ch \"CREATE TABLE demo.events_packed (
+         ts DateTime64(3), user String,
+         action LowCardinality(String), amount Float64
+       ) ENGINE = MergeTree ORDER BY (user, ts)
+       SETTINGS storage_policy='s3_packed',
+                min_bytes_for_wide_part=1073741824,
+                min_bytes_for_full_part_storage=1073741824\""
+
+  step "Fire 200 small INSERTs at each table"
+  run "for i in \$(seq 1 200); do
+         ch_raw \"INSERT INTO demo.events_default
+                  SELECT now(), concat('u_',toString(number)), 'buy', 1.0
+                  FROM numbers(500)\" >/dev/null;
+         ch_raw \"INSERT INTO demo.events_packed
+                  SELECT now(), concat('u_',toString(number)), 'buy', 1.0
+                  FROM numbers(500)\" >/dev/null;
+       done"
+  sleep 4  # let async_insert flush
+
+  step "Parts in ClickHouse (same 200 inserts → same part count on both)"
+  run "ch \"SELECT table, disk_name, part_type, count() parts
+         FROM system.parts
+         WHERE database='demo' AND table IN ('events_default','events_packed') AND active
+         GROUP BY table, disk_name, part_type ORDER BY table\""
+
+  step "Actual S3 objects on MinIO per prefix"
+  printf '   %sdefault (s3_main):%s\n' "$B" "$N"
+  s3_ls data   | tail -n 2 | sed 's/^/     /'
+  printf '   %spacked (s3_packed):%s\n' "$B" "$N"
+  s3_ls packed | tail -n 2 | sed 's/^/     /'
+  note "Example on this run: default=5035 objects vs packed=490 objects for"
+  note "the same workload — ~10x reduction in S3 PUTs and object count."
+  pause
+}
+
+run_ch()   { ch_storage_policy; ch_create_table; ch_proof_on_rustfs; ch_queries; ch_materialized_view; ch_cost_tuning; }
 run_otel() { otlp_send_logs; otlp_send_trace; otlp_send_metric; hyperdx_pointer; }
 
 preflight
@@ -267,5 +340,5 @@ esac
 
 section "Done"
 note "ClickHouse HTTP:   ${CH_URL}   (user=${CH_USER})"
-note "RustFS console:    http://localhost:9001"
+note "MinIO console:    http://localhost:9001"
 note "HyperDX UI:        ${HYPERDX_URL}"

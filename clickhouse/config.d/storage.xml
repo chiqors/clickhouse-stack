@@ -1,0 +1,41 @@
+<clickhouse>
+    <!-- Storage/compute separation: data lives on RustFS (S3-compatible). -->
+    <storage_configuration>
+        <disks>
+            <s3_rustfs>
+                <type>s3</type>
+                <endpoint>http://rustfs:9000/clickhouse/data/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse-secret</secret_access_key>
+                <region>us-east-1</region>
+                <use_environment_credentials>false</use_environment_credentials>
+                <!-- Local cache in front of the object store -->
+                <metadata_path>/var/lib/clickhouse/disks/s3_rustfs/</metadata_path>
+                <support_batch_delete>true</support_batch_delete>
+            </s3_rustfs>
+
+            <s3_cache>
+                <type>cache</type>
+                <disk>s3_rustfs</disk>
+                <path>/var/lib/clickhouse/disks/s3_cache/</path>
+                <max_size>10Gi</max_size>
+                <cache_on_write_operations>1</cache_on_write_operations>
+            </s3_cache>
+        </disks>
+
+        <policies>
+            <s3_main>
+                <volumes>
+                    <main>
+                        <disk>s3_cache</disk>
+                    </main>
+                </volumes>
+            </s3_main>
+        </policies>
+    </storage_configuration>
+
+    <!-- Make the S3 policy the default so new MergeTree tables land on RustFS. -->
+    <merge_tree>
+        <storage_policy>s3_main</storage_policy>
+    </merge_tree>
+</clickhouse>

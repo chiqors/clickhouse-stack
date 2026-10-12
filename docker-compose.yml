@@ -1,0 +1,209 @@
+name: clickhouse-stack
+
+# ClickHouse (compute) <-> RustFS (S3 storage) with rustfs/rc init,
+# plus ClickStack (HyperDX) for observability.
+#
+# Default creds (change for anything beyond local tinkering):
+#   RustFS root:  rustfsadmin / rustfsadmin
+#   S3 for CH:    clickhouse  / clickhouse-secret
+#   Bucket:       clickhouse
+#
+# UIs:
+#   RustFS console: http://localhost:9001
+#   HyperDX UI:     http://localhost:8080
+#   ClickHouse:     http://localhost:8123  (play UI)
+
+services:
+  # ---------- Object storage (S3-compatible) ----------
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      RUSTFS_ROOT_USER: rustfsadmin
+      RUSTFS_ROOT_PASSWORD: rustfsadmin
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ---------- One-shot init: bucket + service account for ClickHouse ----------
+  rustfs-init:
+    image: rustfs/rc:latest
+    container_name: rustfs-init
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        rc alias set local http://rustfs:9000 rustfsadmin rustfsadmin
+        rc mb --ignore-existing local/clickhouse
+        rc admin user add    local clickhouse clickhouse-secret || true
+        rc admin policy attach local readwrite --user clickhouse || true
+        echo "RustFS initialized: bucket=clickhouse user=clickhouse"
+    restart: "no"
+
+  # ---------- ClickHouse (compute) ----------
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"   # HTTP
+      - "9100:9000"   # native (host 9100 to avoid clash with RustFS 9000)
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+      - ./clickhouse/config.d:/etc/clickhouse-server/config.d:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  # ---------- ClickStack (HyperDX) ----------
+  # Metadata store for the HyperDX app
+  mongo:
+    image: mongo:9
+    container_name: hyperdx-mongo
+    volumes:
+      - mongo-data:/data/db
+    restart: unless-stopped
+
+  # OTel collector pre-wired to write into ClickHouse
+  hyperdx-otel:
+    image: docker.hyperdx.io/hyperdx/hyperdx-otel-collector:latest
+    container_name: hyperdx-otel
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_ENDPOINT: "tcp://clickhouse:9000?dial_timeout=10s"
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse
+      HYPERDX_LOG_LEVEL: info
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "13133:13133" # health
+    restart: unless-stopped
+
+  # HyperDX app (UI + API)
+  hyperdx:
+    image: hyperdx/hyperdx:latest
+    container_name: hyperdx
+    depends_on:
+      - mongo
+      - clickhouse
+    environment:
+      MONGO_URI: "mongodb://mongo:27017/hyperdx"
+      CLICKHOUSE_HOST: "http://clickhouse:8123"
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse
+      FRONTEND_URL: "http://localhost:8080"
+      HYPERDX_API_PORT: 8000
+      HYPERDX_APP_PORT: 8080
+      HYPERDX_APP_URL: "http://localhost:8080"
+      HYPERDX_LOG_LEVEL: info
+      # Change these for anything persistent:
+      EXPRESS_SESSION_SECRET: "change-me-session"
+      HYPERDX_API_KEY: "change-me-api-key"
+      # ---- Zero-touch onboarding for the demo ----
+      # The multi-user hyperdx/hyperdx image always requires a one-time
+      # admin signup; it's persisted in the mongo-data volume, so this
+      # only happens on the very first `docker compose up`.
+      # Preseed ClickHouse connection so the "Welcome" modal is skipped.
+      DEFAULT_CONNECTIONS: |
+        [
+          {
+            "name": "Default",
+            "host": "http://clickhouse:8123",
+            "username": "default",
+            "password": "clickhouse"
+          }
+        ]
+      # Preseed the sources against the tables the OTel collector seeded.
+      DEFAULT_SOURCES: |
+        [
+          {
+            "name": "Logs",
+            "kind": "log",
+            "connection": "Default",
+            "from": { "databaseName": "default", "tableName": "otel_logs" },
+            "timestampValueExpression": "Timestamp",
+            "defaultTableSelectExpression": "Timestamp, ServiceName, SeverityText, Body",
+            "serviceNameExpression": "ServiceName",
+            "severityTextExpression": "SeverityText",
+            "bodyExpression": "Body",
+            "eventAttributesExpression": "LogAttributes",
+            "resourceAttributesExpression": "ResourceAttributes",
+            "traceIdExpression": "TraceId",
+            "spanIdExpression": "SpanId"
+          },
+          {
+            "name": "Traces",
+            "kind": "trace",
+            "connection": "Default",
+            "from": { "databaseName": "default", "tableName": "otel_traces" },
+            "timestampValueExpression": "Timestamp",
+            "defaultTableSelectExpression": "Timestamp, ServiceName, SpanName, Duration",
+            "serviceNameExpression": "ServiceName",
+            "spanNameExpression": "SpanName",
+            "spanKindExpression": "SpanKind",
+            "durationExpression": "Duration",
+            "durationPrecision": 9,
+            "traceIdExpression": "TraceId",
+            "spanIdExpression": "SpanId",
+            "parentSpanIdExpression": "ParentSpanId",
+            "statusCodeExpression": "StatusCode",
+            "statusMessageExpression": "StatusMessage",
+            "resourceAttributesExpression": "ResourceAttributes",
+            "eventAttributesExpression": "SpanAttributes"
+          },
+          {
+            "name": "Metrics",
+            "kind": "metric",
+            "connection": "Default",
+            "from": { "databaseName": "default", "tableName": "" },
+            "metricTables": {
+              "gauge": "otel_metrics_gauge",
+              "histogram": "otel_metrics_histogram",
+              "sum": "otel_metrics_sum",
+              "summary": "otel_metrics_summary",
+              "exponential_histogram": "otel_metrics_exponential_histogram"
+            },
+            "timestampValueExpression": "TimeUnix",
+            "resourceAttributesExpression": "ResourceAttributes"
+          }
+        ]
+    ports:
+      - "8080:8080"   # UI
+      - "8000:8000"   # API
+    restart: unless-stopped
+
+volumes:
+  rustfs-data:
+  clickhouse-data:
+  clickhouse-logs:
+  mongo-data:
